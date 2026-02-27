@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patch-and-prove"
+version = "0.1.0"
+description = "Policy-governed proof-carrying patch synthesis CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Patch & Prove Contributors"}]
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6.0"]
+
+[project.scripts]
+pp = "pp.cli:main"
+
+[tool.setuptools]
+packages = ["pp", "pp.providers"]

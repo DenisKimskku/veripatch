@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PatchAndProveConfig",
+  "type": "object",
+  "properties": {
+    "proof_targets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["cmd"],
+        "properties": {
+          "name": {"type": "string"},
+          "cmd": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "network": {"enum": ["deny", "allow"]},
+        "allowed_commands": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "write_allowlist": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "deny_write": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "limits": {
+          "type": "object",
+          "properties": {
+            "max_attempts": {"type": "integer", "minimum": 1},
+            "max_files_changed": {"type": "integer", "minimum": 1},
+            "max_patch_bytes": {"type": "integer", "minimum": 1},
+            "per_command_timeout_sec": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        },
+        "minimize": {"type": "boolean"},
+        "sandbox": {
+          "type": "object",
+          "properties": {
+            "backend": {"enum": ["auto", "copy", "git_worktree", "container"]},
+            "container_runtime": {"type": "string"},
+            "container_image": {"type": "string"},
+            "container_workdir": {"type": "string"},
+            "cpu_limit": {
+              "oneOf": [
+                {"type": "string"},
+                {"type": "number"}
+              ]
+            },
+            "memory_limit": {"type": "string"}
+          },
+          "additionalProperties": false
+        },
+        "attestation": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "mode": {"enum": ["none", "hmac-sha256"]},
+            "key_env": {"type": "string"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

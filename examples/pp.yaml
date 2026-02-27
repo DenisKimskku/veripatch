@@ -1,0 +1,30 @@
+proof_targets:
+  - name: unit
+    cmd: "pytest -q"
+policy:
+  network: deny
+  allowed_commands:
+    - "pytest -q"
+  write_allowlist:
+    - "src/**"
+    - "tests/**"
+  deny_write:
+    - "**/.env"
+    - "**/secrets/**"
+  limits:
+    max_attempts: 3
+    max_files_changed: 8
+    max_patch_bytes: 200000
+    per_command_timeout_sec: 600
+  minimize: true
+  sandbox:
+    backend: container
+    container_runtime: docker
+    container_image: python:3.11-slim
+    container_workdir: /workspace
+    cpu_limit: "2"
+    memory_limit: "2g"
+  attestation:
+    enabled: true
+    mode: hmac-sha256
+    key_env: PP_ATTEST_HMAC_KEY
