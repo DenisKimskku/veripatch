@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
 import time
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,12 @@ from .config import (
 from .context import extract_context
 from .minimize import minimize_patch_hunks
 from .models import AttemptRecord, ContextSlice, RunSummary
-from .patch import apply_patch_with_fallback, diff_between_dirs, patch_stats
+from .patch import (
+    apply_patch_with_fallback,
+    diff_between_dirs,
+    patch_line_change_counts,
+    patch_stats,
+)
 from .provenance import build_workspace_manifest, collect_git_metadata, manifest_sha256
 from .providers import create_provider
 from .providers.base import ProposalInput
@@ -52,6 +59,188 @@ class SessionController:
         sanitized = "".join(c if (c.isalnum() or c in {"-", "_"}) else "_" for c in raw)
         sanitized = sanitized.strip("_") or f"target{index}"
         return f"{index:02d}_{sanitized}"
+
+    def _is_test_path(self, rel_path: str) -> bool:
+        lowered = rel_path.lower()
+        name = Path(rel_path).name.lower()
+        return (
+            lowered.startswith("tests/")
+            or "/tests/" in f"/{lowered}"
+            or name.startswith("test_")
+            or name.endswith("_test.py")
+        )
+
+    def _collect_allowlisted_files(self, sandbox_root: Path, policy: Policy, max_files: int = 40) -> list[str]:
+        files: list[str] = []
+        for path in sorted(sandbox_root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(sandbox_root).as_posix()
+            if rel.startswith(".git/") or rel.startswith(".pp-artifacts/"):
+                continue
+            if not any(fnmatch(rel, pattern) for pattern in policy.write_allowlist):
+                continue
+            if any(fnmatch(rel, pattern) for pattern in policy.deny_write):
+                continue
+            files.append(rel)
+            if len(files) >= max_files:
+                break
+        return files
+
+    def _extract_python_import_candidates(self, snippets: dict[str, str]) -> list[str]:
+        module_paths: list[str] = []
+        seen: set[str] = set()
+        from_re = re.compile(r"^\s*from\s+([a-zA-Z_][\w\.]*)\s+import\s+", re.MULTILINE)
+        import_re = re.compile(r"^\s*import\s+([a-zA-Z_][\w\.]*)", re.MULTILINE)
+
+        for text in snippets.values():
+            for match in from_re.finditer(text):
+                module = match.group(1)
+                candidate = f"{module.replace('.', '/')}.py"
+                if candidate not in seen:
+                    seen.add(candidate)
+                    module_paths.append(candidate)
+            for match in import_re.finditer(text):
+                module = match.group(1).split(".", 1)[0]
+                candidate = f"{module}.py"
+                if candidate not in seen:
+                    seen.add(candidate)
+                    module_paths.append(candidate)
+
+        return module_paths
+
+    def _file_head_snippet(
+        self,
+        root: Path,
+        rel_path: str,
+        max_lines: int = 120,
+        max_chars: int = 6000,
+    ) -> str:
+        target = root / rel_path
+        if not target.exists() or not target.is_file():
+            return ""
+
+        text = target.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        out: list[str] = []
+        for i, line in enumerate(lines[:max_lines], start=1):
+            out.append(f"   {i:5d} | {line}")
+        snippet = "\n".join(out)
+        if len(lines) > max_lines:
+            snippet += f"\n   ... ({len(lines) - max_lines} more lines)"
+        return snippet[:max_chars]
+
+    def _file_raw_snapshot(
+        self,
+        root: Path,
+        rel_path: str,
+        max_lines: int = 200,
+        max_chars: int = 8000,
+    ) -> str:
+        target = root / rel_path
+        if not target.exists() or not target.is_file():
+            return ""
+
+        text = target.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        snippet = "\n".join(lines[:max_lines])
+        if len(lines) > max_lines:
+            snippet += f"\n... ({len(lines) - max_lines} more lines)"
+        return snippet[:max_chars]
+
+    def _collect_editable_snapshots(
+        self,
+        sandbox_root: Path,
+        policy: Policy,
+        max_files: int = 8,
+    ) -> dict[str, str]:
+        snapshots: dict[str, str] = {}
+        for rel_path in self._collect_allowlisted_files(sandbox_root, policy, max_files=max_files):
+            raw = self._file_raw_snapshot(sandbox_root, rel_path)
+            if not raw:
+                continue
+            snapshots[rel_path] = raw
+        return snapshots
+
+    def _augment_context_with_allowlist(
+        self,
+        context: ContextSlice,
+        sandbox_root: Path,
+        policy: Policy,
+    ) -> ContextSlice:
+        snippets = dict(context.snippets)
+        existing_files = {key.split(":", 1)[0] for key in snippets}
+        has_non_test_context = any(not self._is_test_path(path) for path in existing_files)
+        if has_non_test_context:
+            return context
+
+        allowlisted = self._collect_allowlisted_files(sandbox_root, policy)
+        candidates = [path for path in allowlisted if not self._is_test_path(path) and path not in existing_files]
+        if not candidates:
+            return context
+
+        imports = self._extract_python_import_candidates(snippets)
+        prioritized: list[str] = []
+        seen: set[str] = set()
+        for module_path in imports:
+            for path in candidates:
+                if path == module_path or path.endswith(f"/{module_path}"):
+                    if path not in seen:
+                        seen.add(path)
+                        prioritized.append(path)
+
+        for path in candidates:
+            if path not in seen:
+                seen.add(path)
+                prioritized.append(path)
+
+        for path in prioritized[:4]:
+            snippet = self._file_head_snippet(sandbox_root, path)
+            if snippet:
+                snippets[f"{path}:1"] = snippet
+
+        return ContextSlice(
+            locations=context.locations,
+            snippets=snippets,
+            failing_assertions=context.failing_assertions,
+        )
+
+    def _extract_paths_from_diff(self, diff_text: str) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        for line in diff_text.splitlines():
+            if not line.startswith("+++ "):
+                continue
+            raw = line[4:].strip().split("\t", 1)[0]
+            if raw == "/dev/null":
+                continue
+            rel = raw[2:] if raw.startswith(("a/", "b/")) else raw
+            rel = rel.strip()
+            if not rel or rel in seen:
+                continue
+            seen.add(rel)
+            paths.append(rel)
+        return paths
+
+    def _patch_rejection_feedback(self, err: str, diff_text: str, sandbox_root: Path) -> str:
+        paths = self._extract_paths_from_diff(diff_text)
+        if not paths:
+            return err
+
+        chunks: list[str] = [
+            err,
+            (
+                "RETRY_INSTRUCTION: Build the next diff from the exact file snapshots below. "
+                "Use '-' lines that exist verbatim and '+' lines for replacements. "
+                "If hunk matching is hard, rewrite the whole file in one hunk from line 1."
+            ),
+            "Current file snapshots:",
+        ]
+        for rel_path in paths[:2]:
+            snippet = self._file_head_snippet(sandbox_root, rel_path, max_lines=60, max_chars=2500)
+            if snippet:
+                chunks.append(f"### {rel_path}\n{snippet}")
+        return "\n".join(chunks)[:5000]
 
     def _run_targets(
         self,
@@ -204,6 +393,7 @@ class SessionController:
         max_attempts = policy.limits.max_attempts
         timeout = policy.limits.per_command_timeout_sec
         previous_errors: list[str] = []
+        previous_diffs: set[str] = set()
 
         baseline_ok, baseline_result, failing_cmd, _ = self._run_targets(
             config.proof_targets,
@@ -224,8 +414,10 @@ class SessionController:
                     sandbox.root,
                     container_workdir=sandbox.container_workdir if sandbox.backend == "container" else None,
                 )
+                context = self._augment_context_with_allowlist(context, sandbox.root, policy)
                 sanitized = redact_text(final_result.combined_output)
                 redacted_context = self._redacted_context(context)
+                editable_files = self._collect_editable_snapshots(sandbox.root, policy)
 
                 proposal_input = ProposalInput(
                     command=active_failure_cmd,
@@ -234,6 +426,7 @@ class SessionController:
                     previous_attempts=previous_errors,
                     write_allowlist=policy.write_allowlist,
                     deny_write=policy.deny_write,
+                    editable_files=editable_files,
                 )
 
                 try:
@@ -257,7 +450,10 @@ class SessionController:
                 artifacts.write_text(f"attempts/{attempt_no}/applied.patch", proposal.diff)
 
                 if not proposal.diff.strip():
-                    err = "Provider returned empty diff"
+                    err = (
+                        "Provider returned empty diff while proof target is still failing. "
+                        "Return a best-effort patch against allowlisted files."
+                    )
                     attempt_records.append(
                         AttemptRecord(
                             number=attempt_no,
@@ -269,21 +465,51 @@ class SessionController:
                     )
                     artifacts.write_text(f"attempts/{attempt_no}/error.txt", err)
                     previous_errors.append(err)
-                    break
+                    continue
+
+                if proposal.diff in previous_diffs:
+                    err = self._patch_rejection_feedback(
+                        "Patch apply rejected: Provider repeated an identical diff from a prior attempt.",
+                        proposal.diff,
+                        sandbox.root,
+                    )
+                    attempt_records.append(
+                        AttemptRecord(
+                            number=attempt_no,
+                            proposed=proposal,
+                            apply_ok=False,
+                            verify_result=None,
+                            error=err,
+                        )
+                    )
+                    artifacts.write_text(f"attempts/{attempt_no}/error.txt", err)
+                    previous_errors.append(err)
+                    continue
+
+                previous_diffs.add(proposal.diff)
 
                 try:
                     file_count, patch_bytes = patch_stats(proposal.diff)
+                    additions, deletions = patch_line_change_counts(proposal.diff)
                     artifacts.write_json(
                         f"attempts/{attempt_no}/patch_stats.json",
                         {
                             "files": file_count,
                             "bytes": patch_bytes,
+                            "additions": additions,
+                            "deletions": deletions,
                         },
                     )
+                    if additions + deletions == 0:
+                        raise ValueError("Patch contains no line-level edits")
                     changed_paths = apply_patch_with_fallback(proposal.diff, sandbox.root, policy)
                     artifacts.write_json(f"attempts/{attempt_no}/changed_paths.json", changed_paths)
                 except Exception as exc:
-                    err = f"Patch apply rejected: {exc}"
+                    err = self._patch_rejection_feedback(
+                        f"Patch apply rejected: {exc}",
+                        proposal.diff,
+                        sandbox.root,
+                    )
                     attempt_records.append(
                         AttemptRecord(
                             number=attempt_no,

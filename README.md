@@ -20,6 +20,7 @@ Given a failing command, it iterates in a sandbox:
 - Every run emits replayable artifacts.
 - Proof bundles include source provenance (git metadata + workspace manifest).
 - Patch application prefers `git apply` in git sandboxes with parser fallback.
+- Local/OpenAI-compatible proposer retries empty or no-op diff responses and can fall back to single-file rewrite synthesis.
 
 ## Install
 
@@ -46,6 +47,19 @@ python -m unittest discover -s tests -v
 
 ```bash
 pp run "pytest -q"
+```
+
+Try the deterministic failing suite:
+
+```bash
+python examples/failing_targets/run_baseline.py
+```
+
+Then run one target with local model:
+
+```bash
+cd examples/failing_targets/name_error
+pp run "python -m unittest discover -s tests -v" --policy pp.json --provider local --json
 ```
 
 With explicit policy:

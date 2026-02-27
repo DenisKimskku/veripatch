@@ -1,0 +1,23 @@
+[
+  {
+    "id": "name_error",
+    "path": "name_error",
+    "command": "python -m unittest discover -s tests -v",
+    "policy": "pp.json",
+    "expected_failure": "NameError in math_utils.add"
+  },
+  {
+    "id": "slugify_bug",
+    "path": "slugify_bug",
+    "command": "python -m unittest discover -s tests -v",
+    "policy": "pp.json",
+    "expected_failure": "slugify returns missing hyphen"
+  },
+  {
+    "id": "median_bug",
+    "path": "median_bug",
+    "command": "python -m unittest discover -s tests -v",
+    "policy": "pp.json",
+    "expected_failure": "median uses unsorted input"
+  }
+]

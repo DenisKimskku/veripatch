@@ -98,6 +98,102 @@ class ProviderTests(unittest.TestCase):
         headers = captured["headers"]
         self.assertNotIn("Authorization", headers)
 
+    def test_local_provider_fallback_rewrites_single_file_on_empty_diff(self) -> None:
+        responses = [
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"diff":"","rationale":"need sort",'
+                                    '"risk_notes":"low","confidence":0.6}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            ),
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"diff":"","rationale":"retry empty",'
+                                    '"risk_notes":"low","confidence":0.4}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            ),
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"path":"stats_utils.py",'
+                                    '"content":"def median(values):\\n'
+                                    '    ordered = sorted(values)\\n'
+                                    '    mid = len(ordered) // 2\\n'
+                                    '    return ordered[mid]",'
+                                    '"rationale":"sort before indexing",'
+                                    '"risk_notes":"low","confidence":0.8}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            ),
+        ]
+        call_count = {"n": 0}
+
+        def fake_urlopen(req: object, timeout: int = 0) -> _FakeHTTPResponse:
+            del req, timeout
+            idx = call_count["n"]
+            call_count["n"] += 1
+            return _FakeHTTPResponse(responses[idx])
+
+        with patch("pp.providers.openai_compatible.request.urlopen", side_effect=fake_urlopen):
+            with patch.dict(
+                os.environ,
+                {
+                    "PP_LOCAL_BASE_URL": "http://127.0.0.1:8000/v1",
+                    "PP_LOCAL_MODEL": "Qwen/Qwen2.5-Coder-7B-Instruct",
+                    "PP_LOCAL_TIMEOUT_SEC": "5",
+                },
+                clear=False,
+            ):
+                provider = LocalPatchProposer()
+                proposal = provider.propose(
+                    ProposalInput(
+                        command="python -m unittest discover -s tests -v",
+                        failure_output="AssertionError: 1 != 5",
+                        context=ContextSlice(
+                            locations=[],
+                            snippets={"tests/test_stats.py:8": "assert median([9, 1, 5]) == 5"},
+                            failing_assertions=["AssertionError: 1 != 5"],
+                        ),
+                        previous_attempts=[],
+                        write_allowlist=["stats_utils.py"],
+                        deny_write=[],
+                        editable_files={
+                            "stats_utils.py": (
+                                "def median(values):\n"
+                                "    ordered = list(values)\n"
+                                "    mid = len(ordered) // 2\n"
+                                "    return ordered[mid]\n"
+                            )
+                        },
+                    )
+                )
+
+        self.assertEqual(call_count["n"], 3)
+        self.assertIn("+++ b/stats_utils.py", proposal.diff)
+        self.assertIn("sorted(values)", proposal.diff)
+
     @unittest.skipUnless(os.getenv("PP_RUN_LOCAL_LM_SMOKE") == "1", "Set PP_RUN_LOCAL_LM_SMOKE=1")
     def test_local_model_smoke(self) -> None:
         # This test intentionally runs only when user opts in with a live local model server.

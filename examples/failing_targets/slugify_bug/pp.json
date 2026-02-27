@@ -1,0 +1,35 @@
+{
+  "proof_targets": [
+    {
+      "name": "unit",
+      "cmd": "python -m unittest discover -s tests -v"
+    }
+  ],
+  "policy": {
+    "network": "deny",
+    "allowed_commands": [
+      "python -m unittest discover -s tests -v"
+    ],
+    "write_allowlist": [
+      "text_utils.py"
+    ],
+    "deny_write": [
+      "tests/**"
+    ],
+    "limits": {
+      "max_attempts": 4,
+      "max_files_changed": 2,
+      "max_patch_bytes": 40000,
+      "per_command_timeout_sec": 120
+    },
+    "minimize": false,
+    "sandbox": {
+      "backend": "copy",
+      "container_runtime": "docker",
+      "container_image": "python:3.11-slim",
+      "container_workdir": "/workspace",
+      "cpu_limit": null,
+      "memory_limit": null
+    }
+  }
+}

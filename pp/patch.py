@@ -158,6 +158,10 @@ def _validate_patch_constraints(diff_text: str, policy: Policy) -> list[str]:
     if not changed_paths:
         raise ValueError("Patch did not contain any file targets")
 
+    additions, deletions = patch_line_change_counts(diff_text)
+    if additions + deletions == 0:
+        raise ValueError("Patch contains no line-level edits")
+
     if len(changed_paths) > policy.limits.max_files_changed:
         raise ValueError(
             f"Patch changes {len(changed_paths)} files, above max {policy.limits.max_files_changed}"
@@ -179,6 +183,19 @@ def patch_stats(diff_text: str) -> tuple[int, int]:
         return len(_extract_changed_paths(diff_text)), patch_bytes
 
 
+def patch_line_change_counts(diff_text: str) -> tuple[int, int]:
+    additions = 0
+    deletions = 0
+    for line in diff_text.splitlines():
+        if line.startswith(("diff --git ", "--- ", "+++ ", "@@ ", "\\ No newline")):
+            continue
+        if line.startswith("+"):
+            additions += 1
+        elif line.startswith("-"):
+            deletions += 1
+    return additions, deletions
+
+
 def apply_unified_diff(diff_text: str, workspace_root: Path, policy: Policy) -> list[str]:
     parsed = parse_unified_diff(diff_text)
 
@@ -194,6 +211,15 @@ def apply_unified_diff(diff_text: str, workspace_root: Path, policy: Policy) -> 
 
     changed_paths: list[str] = []
 
+    def line_matches(actual: str, payload: str) -> bool:
+        if actual == payload:
+            return True
+        # Tolerate malformed model diffs that omit the explicit context marker
+        # for indented lines, which drops one leading space in payload parsing.
+        if payload.startswith(" ") and actual == f" {payload}":
+            return True
+        return False
+
     def can_apply_hunk_at(lines: list[str], hunk: Hunk, start_idx: int) -> bool:
         if start_idx < 0 or start_idx > len(lines):
             return False
@@ -201,12 +227,12 @@ def apply_unified_diff(diff_text: str, workspace_root: Path, policy: Policy) -> 
         for hline in hunk.lines:
             marker, payload = hline[0], hline[1:]
             if marker in {" ", "-"}:
-                if cursor >= len(lines) or lines[cursor] != payload:
+                if cursor >= len(lines) or not line_matches(lines[cursor], payload):
                     return False
                 cursor += 1
         return True
 
-    def resolve_hunk_start(lines: list[str], hunk: Hunk, suggested_idx: int) -> int:
+    def resolve_hunk_start(lines: list[str], hunk: Hunk, suggested_idx: int, rel_path: str) -> int:
         suggested = max(0, min(suggested_idx, len(lines)))
         has_anchor = any(hline.startswith((" ", "-")) for hline in hunk.lines)
         if not has_anchor:
@@ -219,7 +245,14 @@ def apply_unified_diff(diff_text: str, workspace_root: Path, policy: Policy) -> 
             if can_apply_hunk_at(lines, hunk, idx):
                 candidates.append(idx)
         if not candidates:
-            raise ValueError("Context mismatch applying patch")
+            anchors = [hline[1:].strip() for hline in hunk.lines if hline.startswith((" ", "-"))]
+            anchors = [a for a in anchors if a]
+            anchor_preview = " | ".join(anchors[:3])[:220]
+            raise ValueError(
+                "Context mismatch applying patch to "
+                f"{rel_path}; no matching hunk anchor near old_start={hunk.old_start}; "
+                f"anchors={anchor_preview or '(none)'}"
+            )
         return min(candidates, key=lambda idx: abs(idx - suggested))
 
     for file_patch in parsed.files:
@@ -251,19 +284,19 @@ def apply_unified_diff(diff_text: str, workspace_root: Path, policy: Policy) -> 
             idx = hunk.old_start - 1 + offset
             if hunk.old_count == 0:
                 idx = max(0, idx + 1)
-            idx = resolve_hunk_start(lines, hunk, idx)
+            idx = resolve_hunk_start(lines, hunk, idx, rel_path)
 
             cursor = idx
             replacement: list[str] = []
             for hline in hunk.lines:
                 marker, payload = hline[0], hline[1:]
                 if marker == " ":
-                    if cursor >= len(lines) or lines[cursor] != payload:
+                    if cursor >= len(lines) or not line_matches(lines[cursor], payload):
                         raise ValueError(f"Context mismatch applying patch to {rel_path}")
                     replacement.append(lines[cursor])
                     cursor += 1
                 elif marker == "-":
-                    if cursor >= len(lines) or lines[cursor] != payload:
+                    if cursor >= len(lines) or not line_matches(lines[cursor], payload):
                         raise ValueError(f"Removal mismatch applying patch to {rel_path}")
                     cursor += 1
                 elif marker == "+":

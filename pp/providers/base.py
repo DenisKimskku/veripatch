@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..models import ContextSlice, ProposeOutput
 
@@ -14,6 +14,7 @@ class ProposalInput:
     previous_attempts: list[str]
     write_allowlist: list[str]
     deny_write: list[str]
+    editable_files: dict[str, str] = field(default_factory=dict)
 
 
 class PatchProposer(ABC):
