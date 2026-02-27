@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from pathlib import Path
+import json
+import shutil
+import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
-from .attest import create_attestation, verify_attestation
 from .artifacts import ArtifactWriter
-from .config import config_to_dict, load_config
+from .attest import create_attestation, verify_attestation
+from .config import (
+    Config,
+    Policy,
+    ProofTarget,
+    config_to_dict,
+    load_config,
+    load_config_from_mapping,
+)
 from .context import extract_context
 from .minimize import minimize_patch_hunks
 from .models import AttemptRecord, ContextSlice, RunSummary
@@ -28,24 +38,90 @@ class SessionController:
             failing_assertions=[redact_text(a) for a in ctx.failing_assertions],
         )
 
-    def run(
+    def _safe_target_name(self, name: str, index: int) -> str:
+        raw = name.strip() or f"target{index}"
+        sanitized = "".join(c if (c.isalnum() or c in {"-", "_"}) else "_" for c in raw)
+        sanitized = sanitized.strip("_") or f"target{index}"
+        return f"{index:02d}_{sanitized}"
+
+    def _run_targets(
         self,
-        command: str,
-        policy_path: str | None = None,
-        provider_name: str | None = None,
-        keep_sandbox: bool = False,
-        attest: bool = False,
-        attestation_mode: str | None = None,
-        attestation_key_env: str | None = None,
+        targets: list[ProofTarget],
+        sandbox: Sandbox | None,
+        timeout_sec: int,
+        cwd: Path | None = None,
+        artifacts: ArtifactWriter | None = None,
+        artifact_rel_prefix: str | None = None,
+    ) -> tuple[bool, Any, str, list[dict[str, Any]]]:
+        if not targets:
+            raise RuntimeError("No proof targets configured")
+
+        first_failure = None
+        first_failure_cmd = ""
+        last_result = None
+        last_cmd = ""
+        rows: list[dict[str, Any]] = []
+
+        work_cwd = cwd or (sandbox.root if sandbox else self.workspace_root)
+
+        for idx, target in enumerate(targets, start=1):
+            result = run_command(target.cmd, work_cwd, timeout_sec, sandbox=sandbox)
+            last_result = result
+            last_cmd = target.cmd
+
+            row = {
+                "name": target.name,
+                "cmd": target.cmd,
+                "exit_code": result.exit_code,
+                "duration_sec": result.duration_sec,
+            }
+            rows.append(row)
+
+            if artifacts and artifact_rel_prefix:
+                artifacts.write_command_result(
+                    f"{artifact_rel_prefix}/{self._safe_target_name(target.name, idx)}.json",
+                    result,
+                )
+
+            if first_failure is None and result.exit_code != 0:
+                first_failure = result
+                first_failure_cmd = target.cmd
+
+        if artifacts and artifact_rel_prefix:
+            artifacts.write_json(f"{artifact_rel_prefix}/target_results.json", rows)
+            if len(targets) == 1 and last_result is not None:
+                artifacts.write_command_result(f"{artifact_rel_prefix}/verify.json", last_result)
+
+        representative = first_failure or last_result
+        representative_cmd = first_failure_cmd or last_cmd
+        return first_failure is None, representative, representative_cmd, rows
+
+    def _combined_verify_command(self, targets: list[ProofTarget]) -> str:
+        if len(targets) == 1:
+            return targets[0].cmd
+        return " && ".join(f"({t.cmd})" for t in targets)
+
+    def _execute_session(
+        self,
+        config: Config,
+        resolved_policy_path: Path | None,
+        provider_name: str | None,
+        keep_sandbox: bool,
+        attest: bool,
+        attestation_mode: str | None,
+        attestation_key_env: str | None,
     ) -> RunSummary:
         started_at = time.time()
-        config, resolved_policy_path = load_config(policy_path, command, self.workspace_root)
         policy = config.policy
 
-        if not policy.is_command_allowed(command):
-            raise RuntimeError(
-                f"Command is not allowed by policy: {command}. Allowed: {policy.allowed_commands}"
-            )
+        if not config.proof_targets:
+            raise RuntimeError("No proof targets configured")
+
+        for target in config.proof_targets:
+            if not policy.is_command_allowed(target.cmd):
+                raise RuntimeError(
+                    f"Command is not allowed by policy: {target.cmd}. Allowed: {policy.allowed_commands}"
+                )
 
         provider = create_provider(provider_name)
         active_provider = provider.__class__.__name__
@@ -68,7 +144,7 @@ class SessionController:
         artifacts.write_policy(config_to_dict(config))
 
         repro: dict[str, Any] = {
-            "command": command,
+            "command": self._combined_verify_command(config.proof_targets),
             "workspace_root": str(self.workspace_root),
             "policy_path": str(resolved_policy_path) if resolved_policy_path else None,
             "policy_hash": policy.policy_hash(),
@@ -83,6 +159,7 @@ class SessionController:
             "container_workdir": sandbox.container_workdir,
             "cpu_limit": sandbox.cpu_limit,
             "memory_limit": sandbox.memory_limit,
+            "proof_targets": [{"name": t.name, "cmd": t.cmd} for t in config.proof_targets],
         }
 
         attempt_records: list[AttemptRecord] = []
@@ -90,19 +167,29 @@ class SessionController:
         timeout = policy.limits.per_command_timeout_sec
         previous_errors: list[str] = []
 
-        baseline = run_command(command, sandbox.root, timeout, sandbox=sandbox)
-        artifacts.write_command_result("attempts/0_baseline/verify.json", baseline)
-        final_result = baseline
-        success = baseline.exit_code == 0
+        baseline_ok, baseline_result, failing_cmd, _ = self._run_targets(
+            config.proof_targets,
+            sandbox,
+            timeout,
+            artifacts=artifacts,
+            artifact_rel_prefix="attempts/0_baseline",
+        )
+        final_result = baseline_result
+        active_failure_cmd = failing_cmd
+        success = baseline_ok
 
         if not success:
             for attempt_no in range(1, max_attempts + 1):
-                context = extract_context(final_result.combined_output, sandbox.root)
+                context = extract_context(
+                    final_result.combined_output,
+                    sandbox.root,
+                    container_workdir=sandbox.container_workdir if sandbox.backend == "container" else None,
+                )
                 sanitized = redact_text(final_result.combined_output)
                 redacted_context = self._redacted_context(context)
 
                 proposal_input = ProposalInput(
-                    command=command,
+                    command=active_failure_cmd,
                     failure_output=sanitized,
                     context=redacted_context,
                     previous_attempts=previous_errors,
@@ -171,8 +258,13 @@ class SessionController:
                     previous_errors.append(err)
                     continue
 
-                verify_result = run_command(command, sandbox.root, timeout, sandbox=sandbox)
-                artifacts.write_command_result(f"attempts/{attempt_no}/verify.json", verify_result)
+                verify_ok, verify_result, failing_cmd, _ = self._run_targets(
+                    config.proof_targets,
+                    sandbox,
+                    timeout,
+                    artifacts=artifacts,
+                    artifact_rel_prefix=f"attempts/{attempt_no}/verify",
+                )
 
                 attempt_records.append(
                     AttemptRecord(
@@ -185,12 +277,13 @@ class SessionController:
                 )
 
                 final_result = verify_result
-                if verify_result.exit_code == 0:
+                if verify_ok:
                     success = True
                     break
 
+                active_failure_cmd = failing_cmd
                 previous_errors.append(
-                    f"attempt {attempt_no} verify failed with exit code {verify_result.exit_code}"
+                    f"attempt {attempt_no} verify failed for `{failing_cmd}` with exit code {verify_result.exit_code}"
                 )
 
         final_patch = diff_between_dirs(self.workspace_root, sandbox.root)
@@ -199,7 +292,7 @@ class SessionController:
             minimized = minimize_patch_hunks(
                 patch_text=final_patch,
                 baseline_root=self.workspace_root,
-                verify_cmd=command,
+                verify_cmd=self._combined_verify_command(config.proof_targets),
                 timeout_sec=timeout,
                 policy=policy,
                 execution_sandbox=sandbox,
@@ -213,7 +306,8 @@ class SessionController:
             "# Patch & Prove Summary",
             "",
             f"- success: {str(success).lower()}",
-            f"- command: `{command}`",
+            f"- proof_target_count: {len(config.proof_targets)}",
+            f"- verify_command: `{self._combined_verify_command(config.proof_targets)}`",
             f"- attempts_used: {len(attempt_records)}",
             f"- final_exit_code: {final_result.exit_code}",
             f"- policy_hash: `{policy.policy_hash()}`",
@@ -229,7 +323,7 @@ class SessionController:
         resolved_mode = (attestation_mode or policy.attestation.mode or "none").strip().lower()
         resolved_key_env = (attestation_key_env or policy.attestation.key_env or "PP_ATTEST_HMAC_KEY").strip()
         if should_attest:
-            summary_lines.insert(7, f"- attestation_mode: `{resolved_mode}`")
+            summary_lines.insert(8, f"- attestation_mode: `{resolved_mode}`")
         artifacts.write_summary("\n".join(summary_lines))
 
         repro.update(
@@ -238,7 +332,6 @@ class SessionController:
                 "success": success,
                 "attempts_used": len(attempt_records),
                 "final_exit_code": final_result.exit_code,
-                "proof_targets": [{"name": t.name, "cmd": t.cmd} for t in config.proof_targets],
                 "artifact_dir": str(artifacts.proof_bundle_dir),
             }
         )
@@ -270,6 +363,53 @@ class SessionController:
             },
         )
 
+    def run(
+        self,
+        command: str,
+        policy_path: str | None = None,
+        provider_name: str | None = None,
+        keep_sandbox: bool = False,
+        attest: bool = False,
+        attestation_mode: str | None = None,
+        attestation_key_env: str | None = None,
+    ) -> RunSummary:
+        loaded, resolved_policy_path = load_config(policy_path, command, self.workspace_root)
+        config = Config(
+            proof_targets=[ProofTarget(name="default", cmd=command)],
+            policy=loaded.policy,
+        )
+        return self._execute_session(
+            config=config,
+            resolved_policy_path=resolved_policy_path,
+            provider_name=provider_name,
+            keep_sandbox=keep_sandbox,
+            attest=attest,
+            attestation_mode=attestation_mode,
+            attestation_key_env=attestation_key_env,
+        )
+
+    def prove(
+        self,
+        policy_path: str | None = None,
+        provider_name: str | None = None,
+        keep_sandbox: bool = False,
+        attest: bool = False,
+        attestation_mode: str | None = None,
+        attestation_key_env: str | None = None,
+    ) -> RunSummary:
+        config, resolved_policy_path = load_config(policy_path, "true", self.workspace_root)
+        if not config.proof_targets:
+            raise RuntimeError("No proof targets configured. Add proof_targets in policy file.")
+        return self._execute_session(
+            config=config,
+            resolved_policy_path=resolved_policy_path,
+            provider_name=provider_name,
+            keep_sandbox=keep_sandbox,
+            attest=attest,
+            attestation_mode=attestation_mode,
+            attestation_key_env=attestation_key_env,
+        )
+
     def replay(
         self,
         bundle_dir: Path,
@@ -280,58 +420,93 @@ class SessionController:
         if not repro_path.exists():
             raise RuntimeError(f"Missing repro.json in {bundle_dir}")
 
-        import json
-
         repro = json.loads(repro_path.read_text(encoding="utf-8"))
-        command = repro.get("command")
-        if not command:
-            raise RuntimeError("repro.json does not include a command")
+        fallback_command = str(repro.get("command") or "").strip()
+        if not fallback_command and not repro.get("proof_targets"):
+            raise RuntimeError("repro.json does not include command/proof_targets")
 
-        cwd = cwd_override or Path(str(repro.get("workspace_root") or self.workspace_root))
-        timeout_sec = 600
-        replay_sandbox: Sandbox | None = None
+        targets: list[ProofTarget] = []
+        for idx, item in enumerate(repro.get("proof_targets") or []):
+            if not isinstance(item, dict):
+                continue
+            cmd = str(item.get("cmd") or "").strip()
+            if not cmd:
+                continue
+            name = str(item.get("name") or f"target-{idx + 1}")
+            targets.append(ProofTarget(name=name, cmd=cmd))
 
-        policy_path = bundle_dir / "policy.json"
-        if policy_path.exists():
-            policy_data = json.loads(policy_path.read_text(encoding="utf-8"))
-            timeout_sec = int(
-                policy_data.get("policy", {})
-                .get("limits", {})
-                .get("per_command_timeout_sec", timeout_sec)
-            )
-            sandbox_data = policy_data.get("policy", {}).get("sandbox", {}) or {}
-            network = str(policy_data.get("policy", {}).get("network", "deny"))
-            backend = str(sandbox_data.get("backend", "auto")).strip().lower()
-            if backend == "container":
+        if not targets:
+            targets = [ProofTarget(name="default", cmd=fallback_command)]
+
+        source_root = cwd_override or Path(str(repro.get("workspace_root") or self.workspace_root))
+        source_root = source_root.resolve()
+        if not source_root.exists() or not source_root.is_dir():
+            raise RuntimeError(f"Replay source root does not exist: {source_root}")
+
+        temp_parent = Path(tempfile.mkdtemp(prefix="pp-replay-"))
+        replay_root = temp_parent / "workspace"
+        shutil.copytree(
+            source_root,
+            replay_root,
+            ignore=shutil.ignore_patterns(".pp-artifacts", "__pycache__", ".pytest_cache"),
+        )
+
+        try:
+            timeout_sec = 600
+            policy = Policy(allowed_commands=[t.cmd for t in targets])
+
+            policy_path = bundle_dir / "policy.json"
+            if policy_path.exists():
+                policy_mapping = json.loads(policy_path.read_text(encoding="utf-8"))
+                loaded = load_config_from_mapping(policy_mapping, targets[0].cmd)
+                policy = loaded.policy
+                timeout_sec = policy.limits.per_command_timeout_sec
+
+            final_patch_path = bundle_dir / "final.patch"
+            if final_patch_path.exists():
+                patch_text = final_patch_path.read_text(encoding="utf-8")
+                if patch_text.strip():
+                    apply_unified_diff(patch_text, replay_root, policy)
+
+            replay_sandbox: Sandbox | None = None
+            if policy.sandbox.backend.strip().lower() == "container":
                 replay_sandbox = Sandbox(
-                    root=cwd,
+                    root=replay_root,
                     backend="container",
                     workspace_backend="copy",
-                    control_root=cwd,
+                    control_root=replay_root,
                     cleanup_token=None,
-                    container_runtime=str(sandbox_data.get("container_runtime", "docker")),
-                    container_image=str(sandbox_data.get("container_image", "python:3.11-slim")),
-                    container_workdir=str(sandbox_data.get("container_workdir", "/workspace")),
-                    network=network,
-                    cpu_limit=(
-                        str(sandbox_data["cpu_limit"]) if sandbox_data.get("cpu_limit") is not None else None
-                    ),
-                    memory_limit=(
-                        str(sandbox_data["memory_limit"]) if sandbox_data.get("memory_limit") is not None else None
-                    ),
+                    container_runtime=policy.sandbox.container_runtime,
+                    container_image=policy.sandbox.container_image,
+                    container_workdir=policy.sandbox.container_workdir,
+                    network=policy.network,
+                    cpu_limit=policy.sandbox.cpu_limit,
+                    memory_limit=policy.sandbox.memory_limit,
                 )
 
-        result = run_command(command, cwd, timeout_sec, sandbox=replay_sandbox)
-        payload = {
-            "command": command,
-            "cwd": str(cwd),
-            "exit_code": result.exit_code,
-            "duration_sec": result.duration_sec,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.exit_code == 0,
-            "sandbox_backend": replay_sandbox.backend if replay_sandbox else "native",
-        }
-        if verify_bundle_attestation:
-            payload["attestation"] = verify_attestation(bundle_dir)
-        return payload
+            ok, representative, _, target_rows = self._run_targets(
+                targets,
+                replay_sandbox,
+                timeout_sec,
+                cwd=replay_root,
+                artifacts=None,
+                artifact_rel_prefix=None,
+            )
+
+            payload = {
+                "command": self._combined_verify_command(targets),
+                "cwd": str(source_root),
+                "replay_root": str(replay_root),
+                "exit_code": representative.exit_code,
+                "duration_sec": representative.duration_sec,
+                "stdout": representative.stdout,
+                "stderr": representative.stderr,
+                "success": ok,
+                "sandbox_backend": replay_sandbox.backend if replay_sandbox else "native",
+                "target_results": target_rows,
+            }
+            if verify_bundle_attestation:
+                payload["attestation"] = verify_attestation(bundle_dir)
+            return payload
+        finally:
+            shutil.rmtree(temp_parent, ignore_errors=True)

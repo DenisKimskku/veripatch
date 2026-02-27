@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 
 from .attest import create_attestation, verify_attestation
 from .config import load_config
@@ -13,6 +13,28 @@ def _cmd_run(args: argparse.Namespace) -> int:
     controller = SessionController(Path.cwd())
     summary = controller.run(
         command=args.command,
+        policy_path=args.policy,
+        provider_name=args.provider,
+        keep_sandbox=args.keep_sandbox,
+        attest=args.attest,
+        attestation_mode=args.attestation_mode,
+        attestation_key_env=args.attestation_key_env,
+    )
+
+    print(f"success={summary.success}")
+    print(f"attempts_used={summary.attempts_used}")
+    print(f"final_exit_code={summary.final_result.exit_code}")
+    print(f"final_patch={summary.final_patch_path}")
+    print(f"proof_bundle={summary.proof_bundle_dir}")
+    if summary.extra.get("attestation_path"):
+        print(f"attestation={summary.extra['attestation_path']}")
+
+    return 0 if summary.success else 2
+
+
+def _cmd_prove(args: argparse.Namespace) -> int:
+    controller = SessionController(Path.cwd())
+    summary = controller.prove(
         policy_path=args.policy,
         provider_name=args.provider,
         keep_sandbox=args.keep_sandbox,
@@ -45,6 +67,9 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     print(f"success={result['success']}")
     print(f"exit_code={result['exit_code']}")
     print(f"duration_sec={result['duration_sec']:.3f}")
+    print(f"sandbox_backend={result.get('sandbox_backend')}")
+    if result.get("target_results") is not None:
+        print(f"target_results={result['target_results']}")
     print("--- stdout ---")
     print(result["stdout"])
     print("--- stderr ---")
@@ -107,6 +132,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Environment variable name containing key for hmac-sha256 attestation",
     )
     run_p.set_defaults(func=_cmd_run)
+
+    prove_p = sub.add_parser("prove", help="Run patch-and-prove against all proof_targets in policy")
+    prove_p.add_argument("--policy", help="Path to pp.yaml/pp.json")
+    prove_p.add_argument("--provider", help="Provider name: stub|openai")
+    prove_p.add_argument("--keep-sandbox", action="store_true", help="Do not delete sandbox on exit")
+    prove_p.add_argument("--attest", action="store_true", help="Emit attestation.json for proof bundle")
+    prove_p.add_argument(
+        "--attestation-mode",
+        choices=["none", "hmac-sha256"],
+        help="Attestation signing mode override",
+    )
+    prove_p.add_argument(
+        "--attestation-key-env",
+        help="Environment variable name containing key for hmac-sha256 attestation",
+    )
+    prove_p.set_defaults(func=_cmd_prove)
 
     replay_p = sub.add_parser("replay", help="Replay proof target from proof bundle")
     replay_p.add_argument("bundle", help="Path to proof_bundle directory")

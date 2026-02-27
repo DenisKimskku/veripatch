@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -78,7 +78,7 @@ def _load_mapping(path: Path) -> dict[str, Any]:
         return json.loads(text)
 
     try:
-        import yaml  # type: ignore
+        import yaml
     except ImportError as exc:
         raise RuntimeError(
             "YAML policy requested but PyYAML is not installed. Install with: pip install -e .[yaml]"
@@ -166,6 +166,10 @@ def load_config(policy_path: str | None, fallback_cmd: str, workspace_root: Path
     data = _load_mapping(path)
     cfg = _build_config(data, fallback_cmd)
     return cfg, path
+
+
+def load_config_from_mapping(mapping: dict[str, Any], fallback_cmd: str) -> Config:
+    return _build_config(mapping, fallback_cmd)
 
 
 def config_to_dict(config: Config) -> dict[str, Any]:

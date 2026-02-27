@@ -31,6 +31,15 @@ Optional YAML policy parsing:
 python -m pip install -e .[yaml]
 ```
 
+Development tooling:
+
+```bash
+python -m pip install -e .[dev]
+ruff check .
+mypy pp
+python -m unittest discover -s tests -v
+```
+
 ## Quick start
 
 ```bash
@@ -43,11 +52,19 @@ With explicit policy:
 pp run "pytest -q" --policy pp.yaml
 ```
 
+Run all configured proof targets:
+
+```bash
+pp prove --policy pp.yaml
+```
+
 Replay proof target:
 
 ```bash
 pp replay .pp-artifacts/<session-id>/proof_bundle
 ```
+
+`pp replay` now copies the source workspace to a temp sandbox, applies `final.patch`, and reruns the recorded proof target(s).
 
 Replay + verify attestation:
 

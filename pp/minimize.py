@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from pathlib import Path
 import shutil
 import tempfile
+from dataclasses import replace
+from pathlib import Path
 
 from .config import Policy
-from .patch import FilePatch, Hunk, apply_unified_diff, parse_unified_diff, render_patch_from_filepatches
+from .patch import (
+    FilePatch,
+    apply_unified_diff,
+    parse_unified_diff,
+    render_patch_from_filepatches,
+)
 from .runner import Sandbox, run_command
 
 

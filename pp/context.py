@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import re
+from pathlib import Path
 
 from .models import ContextSlice, Location
-
 
 _TRACEBACK_FILE_RE = re.compile(r'File "(?P<file>.+?)", line (?P<line>\d+)')
 _COMPILER_RE = re.compile(r"(?P<file>[\w./\\-]+):(\s)?(?P<line>\d+)(:(?P<col>\d+))?")
@@ -20,16 +18,28 @@ def _to_relative(path: Path, workspace_root: Path) -> str | None:
         return None
 
 
-def _extract_locations(text: str, workspace_root: Path) -> list[Location]:
+def _resolve_path(raw: str, workspace_root: Path, container_workdir: str | None) -> Path:
+    p = Path(raw)
+    if p.is_absolute():
+        if container_workdir:
+            container_root = Path(container_workdir)
+            try:
+                rel = p.relative_to(container_root)
+                return (workspace_root / rel).resolve()
+            except Exception:
+                pass
+        return p.resolve()
+    return (workspace_root / p).resolve()
+
+
+def _extract_locations(text: str, workspace_root: Path, container_workdir: str | None) -> list[Location]:
     locations: list[Location] = []
     seen: set[tuple[str, int]] = set()
 
     for match in _TRACEBACK_FILE_RE.finditer(text):
         raw = match.group("file")
         line = int(match.group("line"))
-        p = Path(raw)
-        if not p.is_absolute():
-            p = (workspace_root / p).resolve()
+        p = _resolve_path(raw, workspace_root, container_workdir)
         rel = _to_relative(p, workspace_root)
         if rel is None:
             continue
@@ -42,9 +52,7 @@ def _extract_locations(text: str, workspace_root: Path) -> list[Location]:
     for match in _COMPILER_RE.finditer(text):
         raw = match.group("file")
         line = int(match.group("line"))
-        p = Path(raw)
-        if not p.is_absolute():
-            p = (workspace_root / p).resolve()
+        p = _resolve_path(raw, workspace_root, container_workdir)
         rel = _to_relative(p, workspace_root)
         if rel is None:
             continue
@@ -75,8 +83,12 @@ def _snippet_for_location(workspace_root: Path, rel_path: str, line_no: int, rad
     return "\n".join(out)
 
 
-def extract_context(result_text: str, workspace_root: Path) -> ContextSlice:
-    locations = _extract_locations(result_text, workspace_root)
+def extract_context(
+    result_text: str,
+    workspace_root: Path,
+    container_workdir: str | None = None,
+) -> ContextSlice:
+    locations = _extract_locations(result_text, workspace_root, container_workdir)
     snippets: dict[str, str] = {}
     for loc in locations:
         key = f"{loc.file}:{loc.line}"

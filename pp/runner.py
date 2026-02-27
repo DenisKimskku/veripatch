@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 from .config import Policy
 from .models import CommandResult
@@ -36,6 +36,16 @@ def is_git_repo(path: Path) -> bool:
         check=False,
     )
     return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def is_git_clean(path: Path) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(path), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0 and not proc.stdout.strip()
 
 
 def _copy_sandbox(workspace_root: Path) -> Sandbox:
@@ -133,7 +143,7 @@ def create_sandbox(workspace_root: Path, policy: Policy) -> Sandbox:
         return _git_worktree_sandbox(workspace_root)
 
     # auto
-    if is_git_repo(workspace_root):
+    if is_git_repo(workspace_root) and is_git_clean(workspace_root):
         return _git_worktree_sandbox(workspace_root)
     return _copy_sandbox(workspace_root)
 

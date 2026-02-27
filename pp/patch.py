@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import difflib
+import re
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
-import re
 from typing import Iterable
 
 from .config import Policy
-
 
 _HUNK_RE = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
 

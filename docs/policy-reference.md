@@ -35,5 +35,5 @@ Default behavior without policy file:
 - allow exactly the `pp run` command.
 - allow writes to `**`.
 - 3 attempts, 8 max files changed, 200000 max patch bytes, 600s command timeout.
-- sandbox backend `auto` (git worktree when in git repo, else copy).
+- sandbox backend `auto` (git worktree when repo is clean, copy otherwise).
 - attestation disabled.
