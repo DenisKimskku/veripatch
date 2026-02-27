@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ class AttestationPolicy:
 class Policy:
     network: str = "deny"
     allowed_commands: list[str] = field(default_factory=list)
+    allowed_argv: list[list[str]] = field(default_factory=list)
     write_allowlist: list[str] = field(default_factory=lambda: ["**"])
     deny_write: list[str] = field(default_factory=list)
     limits: Limits = field(default_factory=Limits)
@@ -43,9 +45,22 @@ class Policy:
     sandbox: SandboxPolicy = field(default_factory=SandboxPolicy)
     attestation: AttestationPolicy = field(default_factory=AttestationPolicy)
 
-    def is_command_allowed(self, cmd: str) -> bool:
+    def command_execution(self, cmd: str) -> tuple[bool, list[str] | None]:
         normalized = cmd.strip()
-        return normalized in {c.strip() for c in self.allowed_commands}
+        if normalized in {c.strip() for c in self.allowed_commands}:
+            return True, None
+        try:
+            argv = shlex.split(normalized)
+        except ValueError:
+            return False, None
+        for allowed in self.allowed_argv:
+            if argv == allowed:
+                return True, list(allowed)
+        return False, None
+
+    def is_command_allowed(self, cmd: str) -> bool:
+        ok, _ = self.command_execution(cmd)
+        return ok
 
     def policy_hash(self) -> str:
         raw = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -98,6 +113,11 @@ def _build_config(mapping: dict[str, Any], fallback_cmd: str) -> Config:
     policy = Policy(
         network=policy_raw.get("network", "deny"),
         allowed_commands=_as_list(policy_raw.get("allowed_commands")),
+        allowed_argv=[
+            [str(token) for token in _as_list(item)]
+            for item in _as_list(policy_raw.get("allowed_argv"))
+            if _as_list(item)
+        ],
         write_allowlist=_as_list(policy_raw.get("write_allowlist")) or ["**"],
         deny_write=_as_list(policy_raw.get("deny_write")),
         limits=Limits(
@@ -140,10 +160,15 @@ def _build_config(mapping: dict[str, Any], fallback_cmd: str) -> Config:
     if not targets:
         targets = [ProofTarget(name="default", cmd=fallback_cmd)]
 
-    if not policy.allowed_commands:
+    if not policy.allowed_commands and not policy.allowed_argv:
         policy.allowed_commands = [target.cmd for target in targets]
 
-    if fallback_cmd not in policy.allowed_commands:
+    if (
+        fallback_cmd
+        and fallback_cmd not in policy.allowed_commands
+        and not policy.allowed_commands
+        and not policy.allowed_argv
+    ):
         policy.allowed_commands.append(fallback_cmd)
 
     return Config(proof_targets=targets, policy=policy)
@@ -178,6 +203,7 @@ def config_to_dict(config: Config) -> dict[str, Any]:
         "policy": {
             "network": config.policy.network,
             "allowed_commands": config.policy.allowed_commands,
+            "allowed_argv": config.policy.allowed_argv,
             "write_allowlist": config.policy.write_allowlist,
             "deny_write": config.policy.deny_write,
             "limits": {

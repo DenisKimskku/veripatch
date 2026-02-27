@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import difflib
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
@@ -90,7 +92,9 @@ def parse_unified_diff(diff_text: str) -> ParsedPatch:
                     idx += 1
                     continue
                 if not hline.startswith((" ", "+", "-")):
-                    raise ValueError(f"Malformed hunk line: {hline}")
+                    # Some model outputs omit the leading space on context lines.
+                    # Normalize those lines to context markers for robust parsing.
+                    hline = f" {hline}"
                 hunk.lines.append(hline)
                 idx += 1
             current.hunks.append(hunk)
@@ -110,9 +114,69 @@ def _is_path_allowed(rel_path: str, policy: Policy) -> bool:
     return allowed and not denied
 
 
+def _extract_changed_paths(diff_text: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    pending_old: str | None = None
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                candidate = parts[3] if parts[3] != "/dev/null" else parts[2]
+                rel = _strip_prefix(candidate)
+                if rel and rel != "/dev/null" and rel not in seen:
+                    seen.add(rel)
+                    paths.append(rel)
+            continue
+
+        if line.startswith("--- "):
+            pending_old = line[4:].strip().split("\t", 1)[0]
+            continue
+
+        if line.startswith("+++ ") and pending_old is not None:
+            new_path = line[4:].strip().split("\t", 1)[0]
+            candidate = new_path if new_path != "/dev/null" else pending_old
+            rel = _strip_prefix(candidate)
+            if rel and rel != "/dev/null" and rel not in seen:
+                seen.add(rel)
+                paths.append(rel)
+            pending_old = None
+
+    return paths
+
+
+def _validate_patch_constraints(diff_text: str, policy: Policy) -> list[str]:
+    patch_bytes = len(diff_text.encode("utf-8"))
+    if patch_bytes > policy.limits.max_patch_bytes:
+        raise ValueError(f"Patch size exceeds {policy.limits.max_patch_bytes} bytes")
+
+    if "GIT binary patch" in diff_text:
+        raise ValueError("Binary patches are not supported")
+
+    changed_paths = _extract_changed_paths(diff_text)
+    if not changed_paths:
+        raise ValueError("Patch did not contain any file targets")
+
+    if len(changed_paths) > policy.limits.max_files_changed:
+        raise ValueError(
+            f"Patch changes {len(changed_paths)} files, above max {policy.limits.max_files_changed}"
+        )
+
+    for rel_path in changed_paths:
+        if not _is_path_allowed(rel_path, policy):
+            raise ValueError(f"Patch path is not allowed by policy: {rel_path}")
+
+    return changed_paths
+
+
 def patch_stats(diff_text: str) -> tuple[int, int]:
-    parsed = parse_unified_diff(diff_text)
-    return len(parsed.files), len(diff_text.encode("utf-8"))
+    patch_bytes = len(diff_text.encode("utf-8"))
+    try:
+        parsed = parse_unified_diff(diff_text)
+        return len(parsed.files), patch_bytes
+    except Exception:
+        return len(_extract_changed_paths(diff_text)), patch_bytes
 
 
 def apply_unified_diff(diff_text: str, workspace_root: Path, policy: Policy) -> list[str]:
@@ -129,6 +193,34 @@ def apply_unified_diff(diff_text: str, workspace_root: Path, policy: Policy) -> 
         )
 
     changed_paths: list[str] = []
+
+    def can_apply_hunk_at(lines: list[str], hunk: Hunk, start_idx: int) -> bool:
+        if start_idx < 0 or start_idx > len(lines):
+            return False
+        cursor = start_idx
+        for hline in hunk.lines:
+            marker, payload = hline[0], hline[1:]
+            if marker in {" ", "-"}:
+                if cursor >= len(lines) or lines[cursor] != payload:
+                    return False
+                cursor += 1
+        return True
+
+    def resolve_hunk_start(lines: list[str], hunk: Hunk, suggested_idx: int) -> int:
+        suggested = max(0, min(suggested_idx, len(lines)))
+        has_anchor = any(hline.startswith((" ", "-")) for hline in hunk.lines)
+        if not has_anchor:
+            return suggested
+        if can_apply_hunk_at(lines, hunk, suggested):
+            return suggested
+
+        candidates: list[int] = []
+        for idx in range(0, len(lines) + 1):
+            if can_apply_hunk_at(lines, hunk, idx):
+                candidates.append(idx)
+        if not candidates:
+            raise ValueError("Context mismatch applying patch")
+        return min(candidates, key=lambda idx: abs(idx - suggested))
 
     for file_patch in parsed.files:
         rel_path = file_patch.rel_path
@@ -159,8 +251,7 @@ def apply_unified_diff(diff_text: str, workspace_root: Path, policy: Policy) -> 
             idx = hunk.old_start - 1 + offset
             if hunk.old_count == 0:
                 idx = max(0, idx + 1)
-            if idx < 0:
-                idx = 0
+            idx = resolve_hunk_start(lines, hunk, idx)
 
             cursor = idx
             replacement: list[str] = []
@@ -198,6 +289,51 @@ def apply_unified_diff(diff_text: str, workspace_root: Path, policy: Policy) -> 
         changed_paths.append(rel_path)
 
     return changed_paths
+
+
+def _can_use_git_apply(workspace_root: Path) -> bool:
+    if shutil.which("git") is None:
+        return False
+    proc = subprocess.run(
+        ["git", "-C", str(workspace_root), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def _git_apply(diff_text: str, workspace_root: Path) -> None:
+    proc = subprocess.run(
+        ["git", "-C", str(workspace_root), "apply", "--recount", "--whitespace=nowarn", "-"],
+        input=diff_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "git apply failed"
+        raise ValueError(detail)
+
+
+def apply_patch_with_fallback(diff_text: str, workspace_root: Path, policy: Policy) -> list[str]:
+    changed_paths = _validate_patch_constraints(diff_text, policy)
+
+    git_error: str | None = None
+    if _can_use_git_apply(workspace_root):
+        try:
+            _git_apply(diff_text, workspace_root)
+            return changed_paths
+        except Exception as exc:
+            git_error = str(exc)
+
+    try:
+        _ = apply_unified_diff(diff_text, workspace_root, policy)
+        return changed_paths
+    except Exception as parser_exc:
+        if git_error:
+            raise ValueError(f"Patch apply failed (git apply: {git_error}; parser: {parser_exc})")
+        raise
 
 
 def _iter_files(root: Path) -> Iterable[Path]:

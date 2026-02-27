@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -20,7 +21,8 @@ from .config import (
 from .context import extract_context
 from .minimize import minimize_patch_hunks
 from .models import AttemptRecord, ContextSlice, RunSummary
-from .patch import apply_unified_diff, diff_between_dirs, patch_stats
+from .patch import apply_patch_with_fallback, diff_between_dirs, patch_stats
+from .provenance import build_workspace_manifest, collect_git_metadata, manifest_sha256
 from .providers import create_provider
 from .providers.base import ProposalInput
 from .redaction import redact_text
@@ -30,6 +32,13 @@ from .runner import Sandbox, cleanup_sandbox, create_sandbox, run_command
 class SessionController:
     def __init__(self, workspace_root: Path) -> None:
         self.workspace_root = workspace_root.resolve()
+
+    def _command_version(self, argv: list[str]) -> str | None:
+        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            return None
+        out = (proc.stdout or proc.stderr).strip()
+        return out or None
 
     def _redacted_context(self, ctx: ContextSlice) -> ContextSlice:
         return ContextSlice(
@@ -49,6 +58,7 @@ class SessionController:
         targets: list[ProofTarget],
         sandbox: Sandbox | None,
         timeout_sec: int,
+        policy: Policy | None = None,
         cwd: Path | None = None,
         artifacts: ArtifactWriter | None = None,
         artifact_rel_prefix: str | None = None,
@@ -65,7 +75,12 @@ class SessionController:
         work_cwd = cwd or (sandbox.root if sandbox else self.workspace_root)
 
         for idx, target in enumerate(targets, start=1):
-            result = run_command(target.cmd, work_cwd, timeout_sec, sandbox=sandbox)
+            cmd_argv: list[str] | None = None
+            if policy is not None:
+                allowed, cmd_argv = policy.command_execution(target.cmd)
+                if not allowed:
+                    raise RuntimeError(f"Command is not allowed by policy: {target.cmd}")
+            result = run_command(target.cmd, work_cwd, timeout_sec, sandbox=sandbox, argv=cmd_argv)
             last_result = result
             last_cmd = target.cmd
 
@@ -143,6 +158,20 @@ class SessionController:
         )
         artifacts.write_policy(config_to_dict(config))
 
+        manifest_files = build_workspace_manifest(self.workspace_root)
+        manifest_digest = manifest_sha256(manifest_files)
+        artifacts.write_json("workspace_manifest.json", {"files": manifest_files})
+
+        git_meta = collect_git_metadata(self.workspace_root)
+        source_git_diff_path: str | None = None
+        if isinstance(git_meta.get("git_diff"), str) and git_meta["git_diff"]:
+            path = artifacts.write_text("source_git.diff", git_meta["git_diff"])
+            source_git_diff_path = path.name
+
+        container_runtime_version = None
+        if sandbox.container_runtime:
+            container_runtime_version = self._command_version([sandbox.container_runtime, "--version"])
+
         repro: dict[str, Any] = {
             "command": self._combined_verify_command(config.proof_targets),
             "workspace_root": str(self.workspace_root),
@@ -159,7 +188,16 @@ class SessionController:
             "container_workdir": sandbox.container_workdir,
             "cpu_limit": sandbox.cpu_limit,
             "memory_limit": sandbox.memory_limit,
+            "container_runtime_version": container_runtime_version,
             "proof_targets": [{"name": t.name, "cmd": t.cmd} for t in config.proof_targets],
+            "is_git_repo": git_meta.get("is_git_repo"),
+            "git_commit": git_meta.get("git_commit"),
+            "git_branch": git_meta.get("git_branch"),
+            "git_remote_url": git_meta.get("git_remote_url"),
+            "git_dirty": git_meta.get("git_dirty"),
+            "workspace_manifest_path": "workspace_manifest.json",
+            "workspace_manifest_sha256": manifest_digest,
+            "source_git_diff_path": source_git_diff_path,
         }
 
         attempt_records: list[AttemptRecord] = []
@@ -171,6 +209,7 @@ class SessionController:
             config.proof_targets,
             sandbox,
             timeout,
+            policy=policy,
             artifacts=artifacts,
             artifact_rel_prefix="attempts/0_baseline",
         )
@@ -241,7 +280,7 @@ class SessionController:
                             "bytes": patch_bytes,
                         },
                     )
-                    changed_paths = apply_unified_diff(proposal.diff, sandbox.root, policy)
+                    changed_paths = apply_patch_with_fallback(proposal.diff, sandbox.root, policy)
                     artifacts.write_json(f"attempts/{attempt_no}/changed_paths.json", changed_paths)
                 except Exception as exc:
                     err = f"Patch apply rejected: {exc}"
@@ -262,6 +301,7 @@ class SessionController:
                     config.proof_targets,
                     sandbox,
                     timeout,
+                    policy=policy,
                     artifacts=artifacts,
                     artifact_rel_prefix=f"attempts/{attempt_no}/verify",
                 )
@@ -303,7 +343,7 @@ class SessionController:
         final_patch_path = artifacts.write_text("final.patch", final_patch)
 
         summary_lines = [
-            "# Patch & Prove Summary",
+            "# veripatch Summary",
             "",
             f"- success: {str(success).lower()}",
             f"- proof_target_count: {len(config.proof_targets)}",
@@ -466,7 +506,7 @@ class SessionController:
             if final_patch_path.exists():
                 patch_text = final_patch_path.read_text(encoding="utf-8")
                 if patch_text.strip():
-                    apply_unified_diff(patch_text, replay_root, policy)
+                    apply_patch_with_fallback(patch_text, replay_root, policy)
 
             replay_sandbox: Sandbox | None = None
             if policy.sandbox.backend.strip().lower() == "container":
@@ -488,6 +528,7 @@ class SessionController:
                 targets,
                 replay_sandbox,
                 timeout_sec,
+                policy=policy,
                 cwd=replay_root,
                 artifacts=None,
                 artifact_rel_prefix=None,

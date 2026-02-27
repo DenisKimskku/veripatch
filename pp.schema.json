@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "PatchAndProveConfig",
+  "title": "VeripatchConfig",
   "type": "object",
   "properties": {
     "proof_targets": {
@@ -22,6 +22,14 @@
         "allowed_commands": {
           "type": "array",
           "items": {"type": "string"}
+        },
+        "allowed_argv": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1
+          }
         },
         "write_allowlist": {
           "type": "array",

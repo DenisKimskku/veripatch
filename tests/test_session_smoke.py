@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,7 +20,12 @@ class SessionSmokeTests(unittest.TestCase):
         self.assertTrue(summary.success)
         self.assertEqual(summary.attempts_used, 0)
         self.assertTrue(summary.final_patch_path.exists())
-        self.assertTrue((summary.proof_bundle_dir / "repro.json").exists())
+        repro_path = summary.proof_bundle_dir / "repro.json"
+        self.assertTrue(repro_path.exists())
+        repro = json.loads(repro_path.read_text(encoding="utf-8"))
+        self.assertEqual(repro["workspace_manifest_path"], "workspace_manifest.json")
+        self.assertTrue((summary.proof_bundle_dir / repro["workspace_manifest_path"]).exists())
+        self.assertIsNotNone(repro["workspace_manifest_sha256"])
 
     def test_run_with_attestation(self) -> None:
         workspace = Path(tempfile.mkdtemp(prefix="pp-test-session-"))
@@ -146,6 +152,44 @@ class SessionSmokeTests(unittest.TestCase):
         self.assertEqual(summary.attempts_used, 0)
         repro = json.loads((summary.proof_bundle_dir / "repro.json").read_text(encoding="utf-8"))
         self.assertEqual(len(repro["proof_targets"]), 2)
+
+    def test_run_records_dirty_git_diff_metadata(self) -> None:
+        workspace = Path(tempfile.mkdtemp(prefix="pp-test-git-meta-"))
+        subprocess.run(["git", "init"], cwd=str(workspace), check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(workspace),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(workspace),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tracked = workspace / "tracked.txt"
+        tracked.write_text("one\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=str(workspace), check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=str(workspace),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tracked.write_text("two\n", encoding="utf-8")
+
+        controller = SessionController(workspace)
+        summary = controller.run("python -c 'print(1)'", provider_name="stub")
+        repro = json.loads((summary.proof_bundle_dir / "repro.json").read_text(encoding="utf-8"))
+        self.assertTrue(repro["is_git_repo"])
+        self.assertTrue(repro["git_dirty"])
+        self.assertIsNotNone(repro["git_commit"])
+        self.assertEqual(repro["source_git_diff_path"], "source_git.diff")
+        self.assertTrue((summary.proof_bundle_dir / "source_git.diff").exists())
 
 
 if __name__ == "__main__":

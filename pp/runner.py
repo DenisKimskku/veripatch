@@ -170,7 +170,12 @@ def cleanup_sandbox(sandbox: Sandbox) -> None:
     shutil.rmtree(token, ignore_errors=True)
 
 
-def _build_container_command(cmd: str, cwd: Path, sandbox: Sandbox) -> list[str]:
+def _build_container_command(
+    cmd: str,
+    cwd: Path,
+    sandbox: Sandbox,
+    argv: list[str] | None = None,
+) -> list[str]:
     runtime = sandbox.container_runtime or "docker"
     image = sandbox.container_image or "python:3.11-slim"
     workdir = sandbox.container_workdir or "/workspace"
@@ -199,18 +204,27 @@ def _build_container_command(cmd: str, cwd: Path, sandbox: Sandbox) -> list[str]
     if sandbox.memory_limit:
         args += ["--memory", str(sandbox.memory_limit)]
 
-    args += [image, "sh", "-lc", cmd]
+    if argv:
+        args += [image, *argv]
+    else:
+        args += [image, "sh", "-lc", cmd]
     return args
 
 
-def run_command(cmd: str, cwd: Path, timeout_sec: int, sandbox: Sandbox | None = None) -> CommandResult:
+def run_command(
+    cmd: str,
+    cwd: Path,
+    timeout_sec: int,
+    sandbox: Sandbox | None = None,
+    argv: list[str] | None = None,
+) -> CommandResult:
     start = time.time()
 
     if sandbox is not None and sandbox.backend == "container":
-        argv = _build_container_command(cmd, cwd, sandbox)
+        container_argv = _build_container_command(cmd, cwd, sandbox, argv=argv)
         try:
             proc = subprocess.run(
-                argv,
+                container_argv,
                 shell=False,
                 cwd=str(cwd),
                 capture_output=True,
@@ -238,7 +252,7 @@ def run_command(cmd: str, cwd: Path, timeout_sec: int, sandbox: Sandbox | None =
                 if isinstance(exc.stderr, bytes)
                 else (exc.stderr or "")
             )
-            stderr = f"{stderr}\n[Patch&Prove] Container command timed out after {timeout_sec}s".strip()
+            stderr = f"{stderr}\n[veripatch] Container command timed out after {timeout_sec}s".strip()
             return CommandResult(
                 cmd=cmd,
                 exit_code=124,
@@ -252,16 +266,28 @@ def run_command(cmd: str, cwd: Path, timeout_sec: int, sandbox: Sandbox | None =
     env.setdefault("CI", "1")
 
     try:
-        proc = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=str(cwd),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-            check=False,
-        )
+        if argv:
+            proc = subprocess.run(
+                argv,
+                shell=False,
+                cwd=str(cwd),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+            )
+        else:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=str(cwd),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+            )
         duration = time.time() - start
         return CommandResult(
             cmd=cmd,
@@ -274,7 +300,7 @@ def run_command(cmd: str, cwd: Path, timeout_sec: int, sandbox: Sandbox | None =
         duration = time.time() - start
         stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        stderr = f"{stderr}\n[Patch&Prove] Command timed out after {timeout_sec}s".strip()
+        stderr = f"{stderr}\n[veripatch] Command timed out after {timeout_sec}s".strip()
         return CommandResult(
             cmd=cmd,
             exit_code=124,

@@ -5,6 +5,7 @@ Top-level config fields:
 - `proof_targets[]`: named command list.
 - `policy.network`: `deny` or `allow`.
 - `policy.allowed_commands[]`: exact command strings permitted.
+- `policy.allowed_argv[][]`: structured argv entries permitted; these execute without shell.
 - `policy.write_allowlist[]`: glob patterns allowed for patch writes.
 - `policy.deny_write[]`: glob patterns denied even if allowlisted.
 - `policy.limits.max_attempts`
